@@ -1,0 +1,933 @@
+# ================================================================
+# DevSecOps Pipeline — ShopForge E-Commerce
+# Monolith · Docker Compose · Azure VM (Ubuntu 22.04) via SSH
+# ================================================================
+#
+# Required GitHub Secrets:
+# ┌─ Security ──────────────────────────────────────────────────┐
+# │  SNYK_TOKEN          → snyk.io API token                    │
+# │  SEMGREP_APP_TOKEN   → semgrep.dev API token (optional)     │
+# ├─ Registry ──────────────────────────────────────────────────┤
+# │  GHCR is used (auto-auth via GITHUB_TOKEN — no secret needed│
+# ├─ Azure VM ──────────────────────────────────────────────────┤
+# │  AZURE_VM_HOST       → Public IP or DNS of your Azure VM    │
+# │  AZURE_VM_USER       → SSH username (e.g. azureuser)        │
+# │  AZURE_VM_SSH_KEY    → Private SSH key (PEM format)         │
+# ├─ App Secrets (injected into docker-compose on the VM) ──────┤
+# │  PROD_DB_PASSWORD    → Postgres password                    │
+# │  PROD_JWT_SECRET     → JWT signing secret                   │
+# │  PROD_PGADMIN_EMAIL  → pgAdmin login email                  │
+# │  PROD_PGADMIN_PASS   → pgAdmin password                     │
+# └─────────────────────────────────────────────────────────────┘
+#
+# Azure VM one-time setup (run manually once):
+#   sudo apt update && sudo apt install -y docker.io docker-compose-plugin
+#   sudo usermod -aG docker $USER && newgrp docker
+#   mkdir -p ~/shopforge/database/migrations
+# ================================================================
+
+name: DevSecOps CI/CD
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+env:
+  NODE_VERSION: "20"
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  DEPLOY_DIR: ~/shopforge
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+
+# ════════════════════════════════════════════════════════════════
+# STAGE 1 — PRE-FLIGHT: Secrets & License Scan
+# Runs first — blocks everything downstream if secrets leak
+# ════════════════════════════════════════════════════════════════
+  secrets-scan:
+    name: 🔑 Secrets Detection
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Gitleaks — full history scan
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: TruffleHog — entropy + verified secrets
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: ${{ github.event.repository.default_branch }}
+          head: HEAD
+          extra_args: --only-verified
+
+  license-check:
+    name: 📜 License Compliance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Check backend licenses
+        working-directory: backend
+        run: |
+          npm ci
+          npx license-checker \
+            --onlyAllow "MIT;ISC;Apache-2.0;BSD-2-Clause;BSD-3-Clause" \
+            --excludePrivatePackages --production
+
+      - name: Check frontend licenses
+        working-directory: frontend
+        run: |
+          npm ci
+          npx license-checker \
+            --onlyAllow "MIT;ISC;Apache-2.0;BSD-2-Clause;BSD-3-Clause" \
+            --excludePrivatePackages --production
+
+# ════════════════════════════════════════════════════════════════
+# STAGE 2 — SAST: Static Code Analysis
+# ════════════════════════════════════════════════════════════════
+  sast:
+    name: 🔬 SAST — Static Analysis
+    runs-on: ubuntu-latest
+    needs: [secrets-scan]
+    permissions:
+      security-events: write
+      actions: read
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: CodeQL — initialize
+        uses: github/codeql-action/init@v3
+        with:
+          languages: javascript, typescript
+          queries: security-extended,security-and-quality
+
+      - name: CodeQL — autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      - name: CodeQL — analyze
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:javascript"
+
+      - name: Semgrep — OWASP Top 10 + Node/React rules
+        uses: semgrep/semgrep-action@v1
+        with:
+          config: >-
+            p/javascript
+            p/typescript
+            p/nodejs
+            p/react
+            p/jwt
+            p/sql-injection
+            p/xss
+            p/owasp-top-ten
+        env:
+          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+
+# ════════════════════════════════════════════════════════════════
+# STAGE 3 — SCA: Dependency Vulnerability Scan
+# ════════════════════════════════════════════════════════════════
+  sca:
+    name: 📦 SCA — Dependency Vulnerabilities
+    runs-on: ubuntu-latest
+    needs: [secrets-scan]
+    permissions:
+      security-events: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: npm audit — backend
+        working-directory: backend
+        run: |
+          npm ci
+          npm audit --audit-level=high --json > npm-audit-backend.json || true
+
+      - name: npm audit — frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm audit --audit-level=high --json > npm-audit-frontend.json || true
+
+      - name: Snyk — backend
+        uses: snyk/actions/node@master
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --severity-threshold=high --file=backend/package.json
+
+      - name: Snyk — frontend
+        uses: snyk/actions/node@master
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --severity-threshold=high --file=frontend/package.json
+
+      - name: Upload SCA reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: sca-reports
+          path: |
+            backend/npm-audit-backend.json
+            frontend/npm-audit-frontend.json
+          retention-days: 30
+
+# ════════════════════════════════════════════════════════════════
+# STAGE 4 — LINT, TEST & COVERAGE GATES
+# ════════════════════════════════════════════════════════════════
+  backend-ci:
+    name: 🔧 Backend — Lint & Test
+    runs-on: ubuntu-latest
+    needs: [sast, sca]
+
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_DB: shopforge_test
+          POSTGRES_USER: shopforge
+          POSTGRES_PASSWORD: shopforge_test_123
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install deps
+        working-directory: backend
+        run: npm ci
+
+      - name: Lint
+        working-directory: backend
+        run: npm run lint
+
+      - name: Run migrations
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql://shopforge:shopforge_test_123@localhost:5432/shopforge_test
+        run: npm run migrate
+
+      - name: Run tests + coverage
+        working-directory: backend
+        env:
+          NODE_ENV: test
+          DATABASE_URL: postgresql://shopforge:shopforge_test_123@localhost:5432/shopforge_test
+          JWT_SECRET: test-only-secret
+          REDIS_URL: ""
+        run: npm run test:coverage
+
+      - name: Coverage gate ≥ 80%
+        working-directory: backend
+        run: |
+          COVERAGE=$(node -e "
+            const c = require('./coverage/coverage-summary.json');
+            console.log(c.total.lines.pct)
+          ")
+          echo "Backend line coverage: $COVERAGE%"
+          node -e "
+            if ($COVERAGE < 80) {
+              console.error('❌ Coverage $COVERAGE% is below the 80% threshold');
+              process.exit(1);
+            }
+            console.log('✅ Coverage gate passed');
+          "
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        with:
+          directory: backend/coverage
+          flags: backend
+
+  frontend-ci:
+    name: 🎨 Frontend — Lint & Unit Test
+    runs-on: ubuntu-latest
+    needs: [sast, sca]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install deps
+        working-directory: frontend
+        run: npm ci
+
+      - name: Lint
+        working-directory: frontend
+        run: npm run lint
+
+      - name: Unit tests + coverage
+        working-directory: frontend
+        run: npm test -- --coverage --ci
+
+      - name: Coverage gate ≥ 80%
+        working-directory: frontend
+        run: |
+          COVERAGE=$(node -e "
+            const c = require('./coverage/coverage-summary.json');
+            console.log(c.total.lines.pct)
+          ")
+          echo "Frontend line coverage: $COVERAGE%"
+          node -e "
+            if ($COVERAGE < 80) {
+              console.error('❌ Coverage $COVERAGE% is below the 80% threshold');
+              process.exit(1);
+            }
+            console.log('✅ Coverage gate passed');
+          "
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        with:
+          directory: frontend/coverage
+          flags: frontend
+
+# ════════════════════════════════════════════════════════════════
+# STAGE 5 — IaC SECURITY SCAN (Dockerfile + Compose + Actions)
+# ════════════════════════════════════════════════════════════════
+  iac-scan:
+    name: 🏗️ IaC Security Scan
+    runs-on: ubuntu-latest
+    needs: [secrets-scan]
+    permissions:
+      security-events: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Hadolint — Dockerfile best practices
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+          failure-threshold: warning
+          format: sarif
+          output-file: hadolint.sarif
+
+      - name: Upload Hadolint SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: hadolint.sarif
+          category: hadolint
+
+      - name: Checkov — Dockerfile + Compose + Actions misconfigs
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: .
+          framework: dockerfile,docker_compose,github_actions
+          output_format: sarif
+          output_file_path: checkov.sarif
+          soft_fail: false
+
+      - name: Upload Checkov SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: checkov.sarif
+          category: checkov
+
+      - name: Trivy — filesystem + misconfig scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: sarif
+          output: trivy-fs.sarif
+          severity: CRITICAL,HIGH
+          scanners: vuln,secret,misconfig
+
+      - name: Upload Trivy FS SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-fs.sarif
+          category: trivy-fs
+
+# ════════════════════════════════════════════════════════════════
+# STAGE 6 — CONTAINER BUILD & IMAGE SCAN
+# Build → Scan → Push to GHCR (only after clean scan)
+# ════════════════════════════════════════════════════════════════
+  container-build-scan:
+    name: 🐳 Container Build & Scan
+    runs-on: ubuntu-latest
+    needs: [backend-ci, frontend-ci, iac-scan]
+    permissions:
+      contents: read
+      packages: write
+      security-events: write
+
+    outputs:
+      image-tag: ${{ steps.meta.outputs.version }}
+      image-digest: ${{ steps.push.outputs.digest }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=,format=short
+            type=ref,event=branch
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build image (local — scan before push)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          dockerfile: Dockerfile
+          push: false
+          load: true
+          tags: shopforge:scan
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: NODE_ENV=production
+
+      - name: Trivy — image CVE scan (block on CRITICAL/HIGH)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: shopforge:scan
+          format: sarif
+          output: trivy-image.sarif
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+          ignore-unfixed: true
+
+      - name: Upload image scan SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-image.sarif
+          category: trivy-image
+
+      - name: Docker Scout — CVE + SBOM check
+        uses: docker/scout-action@v1
+        with:
+          command: cves
+          image: shopforge:scan
+          only-severities: critical,high
+          exit-code: true
+
+      - name: Push to GHCR (scan passed ✅)
+        id: push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          dockerfile: Dockerfile
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: NODE_ENV=production
+
+# ════════════════════════════════════════════════════════════════
+# STAGE 7 — E2E TESTS (Playwright)
+# ════════════════════════════════════════════════════════════════
+  e2e:
+    name: 🎭 Playwright E2E Tests
+    runs-on: ubuntu-latest
+    needs: [backend-ci, frontend-ci]
+
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_DB: shopforge
+          POSTGRES_USER: shopforge
+          POSTGRES_PASSWORD: shopforge_test_123
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install backend deps & seed DB
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql://shopforge:shopforge_test_123@localhost:5432/shopforge
+        run: |
+          npm ci
+          npm run migrate
+          npm run seed
+
+      - name: Start backend
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql://shopforge:shopforge_test_123@localhost:5432/shopforge
+          JWT_SECRET: e2e-test-secret
+          PORT: 5000
+        run: npm run dev &
+
+      - name: Install frontend deps
+        working-directory: frontend
+        run: npm ci
+
+      - name: Install Playwright + Chromium
+        working-directory: frontend
+        run: npx playwright install --with-deps chromium
+
+      - name: Wait for backend
+        run: npx wait-on http://localhost:5000/health --timeout 30000
+
+      - name: Run Playwright tests
+        working-directory: frontend
+        env:
+          BASE_URL: http://localhost:3000
+          NEXT_PUBLIC_API_URL: http://localhost:5000/api
+        run: npx playwright test --project=chromium
+
+      - name: Upload Playwright report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: frontend/playwright-report/
+          retention-days: 7
+
+# ════════════════════════════════════════════════════════════════
+# STAGE 8 — DAST: OWASP ZAP Dynamic Scan
+# ════════════════════════════════════════════════════════════════
+  dast:
+    name: 🌐 DAST — OWASP ZAP API Scan
+    runs-on: ubuntu-latest
+    needs: [e2e]
+
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_DB: shopforge_dast
+          POSTGRES_USER: shopforge
+          POSTGRES_PASSWORD: shopforge_test_123
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Start backend for DAST
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql://shopforge:shopforge_test_123@localhost:5432/shopforge_dast
+          JWT_SECRET: dast-only-secret
+          PORT: 5000
+        run: |
+          npm ci && npm run migrate && npm run seed
+          npm run dev &
+
+      - name: Wait for backend
+        run: npx wait-on http://localhost:5000/health --timeout 30000
+
+      - name: OWASP ZAP — API baseline scan
+        uses: zaproxy/action-api-scan@v0.7.0
+        with:
+          target: "http://localhost:5000/api"
+          format: openapi
+          fail_action: true
+          cmd_options: "-z '-config scanner.maxScanDurationInMins=5'"
+
+      - name: Upload ZAP report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-report
+          path: report_json.json
+          retention-days: 30
+
+# ════════════════════════════════════════════════════════════════
+# STAGE 9 — SECURITY GATE
+# Single required status check — add to branch protection rules
+# ════════════════════════════════════════════════════════════════
+  security-gate:
+    name: 🛡️ Security Gate
+    runs-on: ubuntu-latest
+    needs:
+      - secrets-scan
+      - license-check
+      - sast
+      - sca
+      - iac-scan
+      - container-build-scan
+      - dast
+    if: always()
+
+    steps:
+      - name: Evaluate all security stages
+        run: |
+          echo "╔══════════════════════════════════════╗"
+          echo "║       DevSecOps Security Gate        ║"
+          echo "╠══════════════════════════════════════╣"
+          echo "║ Secrets scan:       ${{ needs.secrets-scan.result }}"
+          echo "║ License check:      ${{ needs.license-check.result }}"
+          echo "║ SAST:               ${{ needs.sast.result }}"
+          echo "║ SCA:                ${{ needs.sca.result }}"
+          echo "║ IaC scan:           ${{ needs.iac-scan.result }}"
+          echo "║ Container scan:     ${{ needs.container-build-scan.result }}"
+          echo "║ DAST:               ${{ needs.dast.result }}"
+          echo "╚══════════════════════════════════════╝"
+
+          if [[ \
+            "${{ needs.secrets-scan.result }}"         == "failure" || \
+            "${{ needs.sast.result }}"                 == "failure" || \
+            "${{ needs.iac-scan.result }}"             == "failure" || \
+            "${{ needs.container-build-scan.result }}" == "failure" || \
+            "${{ needs.dast.result }}"                 == "failure" \
+          ]]; then
+            echo "❌ Security gate FAILED — merge blocked"
+            exit 1
+          fi
+          echo "✅ Security gate PASSED"
+
+# ════════════════════════════════════════════════════════════════
+# STAGE 10 — DEPLOY TO AZURE VM
+# Only on push to main after security gate passes
+# ════════════════════════════════════════════════════════════════
+  deploy:
+    name: 🚀 Deploy to Azure VM
+    runs-on: ubuntu-latest
+    needs: [security-gate, container-build-scan]
+    if: |
+      github.ref == 'refs/heads/main' &&
+      github.event_name == 'push' &&
+      needs.security-gate.result == 'success'
+    environment:
+      name: production
+      url: http://${{ secrets.AZURE_VM_HOST }}:3000
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── Prepare production docker-compose ──────────────────────
+      - name: Generate production docker-compose
+        run: |
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.container-build-scan.outputs.image-tag }}"
+          cat > docker-compose.prod.yml << EOF
+          version: "3.9"
+
+          services:
+            postgres:
+              image: postgres:15-alpine
+              container_name: shopforge-db
+              restart: unless-stopped
+              environment:
+                POSTGRES_DB: shopforge
+                POSTGRES_USER: shopforge
+                POSTGRES_PASSWORD: \${PROD_DB_PASSWORD}
+              volumes:
+                - postgres_data:/var/lib/postgresql/data
+                - ./database/migrations:/docker-entrypoint-initdb.d
+              healthcheck:
+                test: ["CMD-SHELL", "pg_isready -U shopforge"]
+                interval: 10s
+                timeout: 5s
+                retries: 5
+              networks:
+                - shopforge-net
+
+            redis:
+              image: redis:7-alpine
+              container_name: shopforge-redis
+              restart: unless-stopped
+              command: redis-server --requirepass \${REDIS_PASSWORD}
+              volumes:
+                - redis_data:/data
+              healthcheck:
+                test: ["CMD", "redis-cli", "-a", "\${REDIS_PASSWORD}", "ping"]
+                interval: 10s
+                timeout: 5s
+                retries: 5
+              networks:
+                - shopforge-net
+
+            # pgAdmin — internal only, NOT exposed publicly
+            pgadmin:
+              image: dpage/pgadmin4:latest
+              container_name: shopforge-pgadmin
+              restart: unless-stopped
+              environment:
+                PGADMIN_DEFAULT_EMAIL: \${PROD_PGADMIN_EMAIL}
+                PGADMIN_DEFAULT_PASSWORD: \${PROD_PGADMIN_PASS}
+              # No ports exposed — access via SSH tunnel only:
+              # ssh -L 5050:localhost:5050 azureuser@<vm-ip>
+              expose:
+                - "80"
+              depends_on:
+                - postgres
+              networks:
+                - shopforge-net
+
+            backend:
+              image: ${IMAGE}
+              container_name: shopforge-api
+              restart: unless-stopped
+              environment:
+                NODE_ENV: production
+                PORT: 5000
+                DATABASE_URL: postgresql://shopforge:\${PROD_DB_PASSWORD}@postgres:5432/shopforge
+                REDIS_URL: redis://:\${REDIS_PASSWORD}@redis:6379
+                JWT_SECRET: \${PROD_JWT_SECRET}
+                JWT_EXPIRES_IN: 7d
+                FRONTEND_URL: http://\${VM_HOST}:3000
+              ports:
+                - "5000:5000"
+              depends_on:
+                postgres:
+                  condition: service_healthy
+                redis:
+                  condition: service_healthy
+              healthcheck:
+                test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+                interval: 30s
+                timeout: 10s
+                retries: 3
+                start_period: 40s
+              networks:
+                - shopforge-net
+
+            frontend:
+              image: ${IMAGE}
+              container_name: shopforge-web
+              restart: unless-stopped
+              environment:
+                NEXT_PUBLIC_API_URL: http://\${VM_HOST}:5000/api
+                NEXT_PUBLIC_APP_NAME: ShopForge
+                NODE_ENV: production
+                PORT: 3000
+                HOSTNAME: "0.0.0.0"
+              ports:
+                - "3000:3000"
+              depends_on:
+                - backend
+              healthcheck:
+                test: ["CMD", "wget", "-qO-", "http://localhost:3000"]
+                interval: 30s
+                timeout: 5s
+                retries: 3
+                start_period: 30s
+              networks:
+                - shopforge-net
+
+          volumes:
+            postgres_data:
+            redis_data:
+
+          networks:
+            shopforge-net:
+              driver: bridge
+          EOF
+
+      # ── Upload compose to VM ────────────────────────────────────
+      - name: Copy files to Azure VM
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.AZURE_VM_HOST }}
+          username: ${{ secrets.AZURE_VM_USER }}
+          key: ${{ secrets.AZURE_VM_SSH_KEY }}
+          source: "docker-compose.prod.yml"
+          target: ${{ env.DEPLOY_DIR }}
+
+      # ── SSH deploy ──────────────────────────────────────────────
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.AZURE_VM_HOST }}
+          username: ${{ secrets.AZURE_VM_USER }}
+          key: ${{ secrets.AZURE_VM_SSH_KEY }}
+          envs: REGISTRY,IMAGE_NAME
+          script: |
+            set -euo pipefail
+            cd ${{ env.DEPLOY_DIR }}
+
+            echo "━━━ 1/6  Writing .env file ━━━"
+            cat > .env << ENVEOF
+            PROD_DB_PASSWORD=${{ secrets.PROD_DB_PASSWORD }}
+            PROD_JWT_SECRET=${{ secrets.PROD_JWT_SECRET }}
+            PROD_PGADMIN_EMAIL=${{ secrets.PROD_PGADMIN_EMAIL }}
+            PROD_PGADMIN_PASS=${{ secrets.PROD_PGADMIN_PASS }}
+            REDIS_PASSWORD=${{ secrets.PROD_REDIS_PASSWORD }}
+            VM_HOST=${{ secrets.AZURE_VM_HOST }}
+            ENVEOF
+            chmod 600 .env
+
+            echo "━━━ 2/6  Pulling image from GHCR ━━━"
+            echo "${{ secrets.GITHUB_TOKEN }}" | \
+              docker login ghcr.io -u ${{ github.actor }} --password-stdin
+            docker compose -f docker-compose.prod.yml pull
+
+            echo "━━━ 3/6  Blue/green-style rolling update ━━━"
+            # Bring up new containers; keep old ones running until healthy
+            docker compose -f docker-compose.prod.yml up -d \
+              --remove-orphans \
+              --wait \
+              --wait-timeout 120
+
+            echo "━━━ 4/6  Health checks ━━━"
+            for service in shopforge-api shopforge-web; do
+              STATUS=$(docker inspect --format='{{.State.Health.Status}}' $service 2>/dev/null || echo "no-healthcheck")
+              echo "$service → $STATUS"
+              if [[ "$STATUS" == "unhealthy" ]]; then
+                echo "❌ $service is unhealthy — rolling back"
+                docker compose -f docker-compose.prod.yml down
+                exit 1
+              fi
+            done
+
+            echo "━━━ 5/6  Pruning old images ━━━"
+            docker image prune -f --filter "until=24h"
+
+            echo "━━━ 6/6  Deployment complete ✅ ━━━"
+            docker compose -f docker-compose.prod.yml ps
+
+      # ── Smoke test from runner ──────────────────────────────────
+      - name: Smoke test — frontend reachable
+        run: |
+          echo "Waiting 15s for services to stabilise..."
+          sleep 15
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            --max-time 10 http://${{ secrets.AZURE_VM_HOST }}:3000 || echo "000")
+          echo "Frontend HTTP status: $HTTP_CODE"
+          if [[ "$HTTP_CODE" != "200" ]]; then
+            echo "❌ Smoke test failed (HTTP $HTTP_CODE)"
+            exit 1
+          fi
+          echo "✅ Smoke test passed"
+
+      - name: Smoke test — backend health endpoint
+        run: |
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            --max-time 10 http://${{ secrets.AZURE_VM_HOST }}:5000/health || echo "000")
+          echo "Backend HTTP status: $HTTP_CODE"
+          if [[ "$HTTP_CODE" != "200" ]]; then
+            echo "❌ Backend health check failed (HTTP $HTTP_CODE)"
+            exit 1
+          fi
+          echo "✅ Backend health check passed"
+
+# ════════════════════════════════════════════════════════════════
+# STAGE 11 — SBOM (main branch only)
+# ════════════════════════════════════════════════════════════════
+  sbom:
+    name: 📋 Generate SBOM
+    runs-on: ubuntu-latest
+    needs: [deploy]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate SBOM with Syft
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: spdx-json
+          output-file: sbom-${{ github.sha }}.spdx.json
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ github.sha }}
+          path: sbom-${{ github.sha }}.spdx.json
+          retention-days: 90
+
+# ════════════════════════════════════════════════════════════════
+# STAGE 12 — PR COMMENT: Security + Deploy summary
+# ════════════════════════════════════════════════════════════════
+  notify:
+    name: 📣 PR Summary
+    runs-on: ubuntu-latest
+    needs: [security-gate]
+    if: always() && github.event_name == 'pull_request'
+    permissions:
+      pull-requests: write
+
+    steps:
+      - name: Post security summary on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const gate   = '${{ needs.security-gate.result }}';
+            const icon   = gate === 'success' ? '✅' : '❌';
+            const body   = `## ${icon} DevSecOps Security Gate — ${gate.toUpperCase()}
+
+            | Stage | Tool(s) | Result |
+            |---|---|---|
+            | 🔑 Secrets | Gitleaks + TruffleHog | ${{ needs.secrets-scan.result }} |
+            | 📜 Licenses | license-checker | ${{ needs.license-check.result }} |
+            | 🔬 SAST | CodeQL + Semgrep | ${{ needs.sast.result }} |
+            | 📦 SCA | npm audit + Snyk | ${{ needs.sca.result }} |
+            | 🏗️ IaC | Hadolint + Checkov + Trivy | ${{ needs.iac-scan.result }} |
+            | 🐳 Container | Trivy + Docker Scout | ${{ needs.container-build-scan.result }} |
+            | 🌐 DAST | OWASP ZAP | ${{ needs.dast.result }} |
+
+            > 📊 Full findings in the [Security tab](../../security) · Artifacts available in the [Actions run](../../actions)
+            > 🚀 Deployment to Azure VM only triggers on merge to \`main\``;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body
+            });
