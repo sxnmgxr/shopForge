@@ -18,6 +18,9 @@
 # │  PROD_JWT_SECRET     → JWT signing secret                   │
 # │  PROD_PGADMIN_EMAIL  → pgAdmin login email                  │
 # │  PROD_PGADMIN_PASS   → pgAdmin password                     │
+# │  PROD_REDIS_PASSWORD → Redis password                       │
+# ├─ GitHub Variables (for URL display) ────────────────────────┤
+# │  AZURE_VM_HOST       → Same as secret, but as variable      │
 # └─────────────────────────────────────────────────────────────┘
 #
 # Azure VM one-time setup (run manually once):
@@ -653,7 +656,8 @@ jobs:
       needs.security-gate.result == 'success'
     environment:
       name: production
-      url: http://${{ secrets.AZURE_VM_HOST }}:3000
+      # Using vars instead of secrets for URL display (FIXED LINE 656)
+      url: http://${{ vars.AZURE_VM_HOST }}:3000
 
     steps:
       - uses: actions/checkout@v4
